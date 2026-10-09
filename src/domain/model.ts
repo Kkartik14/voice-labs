@@ -2,7 +2,19 @@ export type ExecutionMode = "deterministic" | "tvic" | "audio";
 
 export type ProviderInputMode = "scripted_transcript" | "audio_fixture";
 
-export type RunStatus = "passed" | "failed" | "unknown" | "cancelled" | "error";
+export type RunStatus = "queued" | "running" | "passed" | "failed" | "unknown" | "cancelled" | "error";
+
+/** Minimal row state for refreshing experiment history without run artifacts. */
+export interface ExperimentRunStatusSnapshot {
+  id: string;
+  status: RunStatus;
+}
+
+/** Status reconciliation for the recent page plus the caller's previously active run IDs. */
+export interface ExperimentRunProgressSnapshot {
+  runs: ExperimentRunStatusSnapshot[];
+  missingRunIds: string[];
+}
 
 export type EvaluationStatus = "passed" | "failed" | "unknown";
 
@@ -10,9 +22,16 @@ export type EvaluatorKind = "outcome" | "guardrail" | "phrase" | "tool_call" | "
 
 export type VariantStrategy = "reliable" | "concise" | "fragile";
 
+/** Identity and project authorization established by the Platform API boundary. */
+export interface ProjectContext {
+  readonly userId: string;
+  readonly projectId: string;
+}
+
 export interface ScenarioRevision {
   id: string;
   scenarioId: string;
+  projectId: string;
   revision: number;
   name: string;
   description: string;
@@ -28,11 +47,13 @@ export interface ScenarioRevision {
   /** Optional per-turn WAV/PCM fixture paths used by the TVIC audio tier. */
   audioFixtures?: string[];
   createdAt: string;
+  createdBy: string;
 }
 
 export interface VariantRevision {
   id: string;
   variantId: string;
+  projectId: string;
   revision: number;
   name: string;
   description: string;
@@ -43,6 +64,7 @@ export interface VariantRevision {
   latencyMs: number;
   providerLabel: string;
   createdAt: string;
+  createdBy: string;
 }
 
 export interface EvaluatorDefinition {
@@ -53,16 +75,31 @@ export interface EvaluatorDefinition {
 }
 
 export interface Experiment {
+  /** Immutable revision identifier. */
   id: string;
+  /** Stable identifier shared by all revisions of this experiment. */
+  experimentId: string;
+  projectId: string;
+  revision: number;
   name: string;
   description: string;
+  /** Logical IDs selected by the author. */
   scenarioIds: string[];
   variantIds: string[];
+  /** Exact immutable inputs pinned when this experiment revision was saved. */
+  scenarioRevisionIds: string[];
+  variantRevisionIds: string[];
   repetitions: number;
   mode: ExecutionMode;
+  /** Whether this immutable experiment revision requests metadata-only Earshot capture. */
+  captureEvidence: boolean;
   evaluatorIds: string[];
   createdAt: string;
+  createdBy: string;
 }
+
+/** Small revision history projection used by the detail selector. */
+export type ExperimentRevisionSummary = Pick<Experiment, "id" | "experimentId" | "revision" | "name" | "createdAt">;
 
 export interface TranscriptTurn {
   index: number;
@@ -88,6 +125,8 @@ export interface RunMetrics {
   firstResponseMs?: number;
 }
 
+export type LatencyScope = "executor_wall_clock_including_setup_excluding_persistence";
+
 export interface ProviderTrace {
   runtime: "tvic";
   inputMode: ProviderInputMode;
@@ -95,6 +134,10 @@ export interface ProviderTrace {
   stt: string;
   llm: string;
   tts: string;
+  sttModel?: string;
+  llmModel?: string;
+  ttsModel?: string;
+  ttsVoiceId?: string;
 }
 
 export interface RunError {
@@ -104,15 +147,27 @@ export interface RunError {
 
 export interface RunArtifact {
   id: string;
+  projectId: string;
+  /** Stable logical experiment identifier. */
   experimentId: string;
+  /** Exact immutable experiment revision used for this run. */
+  experimentRevisionId: string;
+  /** Exact immutable scenario and variant revision IDs. */
   scenarioId: string;
   variantId: string;
+  /** TVIC identifiers are retained for downstream correlation. */
+  callId?: string;
+  sessionId?: string;
   repetition: number;
   seed: number;
   mode: ExecutionMode;
-  startedAt: string;
-  completedAt: string;
-  durationMs: number;
+  /** Timestamp at which this attempt entered the worker run. */
+  queuedAt?: string;
+  /** Set when the executor begins; absent while queued. */
+  startedAt?: string;
+  completedAt?: string;
+  durationMs?: number;
+  latencyScope: LatencyScope;
   transcript: TranscriptTurn[];
   toolCalls: ToolCall[];
   finalFacts: string[];
@@ -124,6 +179,35 @@ export interface RunArtifact {
   status?: RunStatus;
   evaluations?: EvaluationResult[];
   evidence?: EvidenceReference;
+}
+
+/** Fields needed by the run screen to refresh evidence delivery status. */
+export type RunEvidenceProgress = Pick<EvidenceReference, "status">
+  & Partial<Pick<EvidenceReference, "sessionId" | "message">>;
+
+/** Fields needed to refresh run progress without retransmitting the full artifact. */
+export type RunProgressSnapshot = Pick<RunArtifact, "id" | "status">
+  & { evidence?: RunEvidenceProgress };
+
+/** Run metadata used by list screens; it deliberately excludes transcripts and tool payloads. */
+export type RunSummary = Pick<RunArtifact,
+  "id" | "experimentId" | "experimentRevisionId" | "scenarioId" | "variantId" |
+  "repetition" | "startedAt" | "durationMs" | "status"
+> & {
+  experimentName?: string;
+  scenarioName?: string;
+  variantName?: string;
+};
+
+export interface RunPageCursor {
+  startedAt: string;
+  id: string;
+}
+
+export interface ExperimentRunPage {
+  runs: RunArtifact[];
+  hasMore: boolean;
+  nextCursor: RunPageCursor | null;
 }
 
 export interface EvaluationResult {
@@ -140,15 +224,65 @@ export interface EvaluationResult {
 export interface EvidenceReference {
   source: "earshot";
   incidentId?: string;
+  upstreamProjectId?: string;
+  sessionId?: string;
   bundleDigest?: string;
   endpoint: string;
-  status: "attached" | "unavailable" | "not_requested";
+  status: "pending" | "attached" | "unavailable" | "not_requested";
+  message?: string;
+  /** Durable delivery attempts; network attempts are reserved before dispatch so crashes cannot reset the budget. */
+  attemptCount?: number;
+  /** Earliest UTC time when the persisted metadata-only incident may be retried. */
+  retryAt?: string;
 }
 
 export interface RegressionEntry {
+  projectId: string;
   scenarioId: string;
   revision: number;
   promotedAt: string;
+  promotedBy: string;
+}
+
+export type RegressionMembership = Pick<RegressionEntry, "scenarioId" | "revision">;
+
+/** Minimal durable accounting record; intentionally survives deletion of the run artifact. */
+export interface ProviderAttemptUsage {
+  projectId: string;
+  runId: string;
+  queuedAt: string;
+}
+
+export interface AcceptedRunStart {
+  experimentId: string;
+  runIds: string[];
+  status: "queued";
+}
+
+/** Durable idempotency receipt for an accepted run-start request. */
+export interface RunStartRequestRecord {
+  requestKeyHash: string;
+  requestFingerprint: string;
+  status: "preparing" | "accepted";
+  ownerId: string;
+  leaseExpiresAt: string;
+  createdAt: string;
+  acceptance?: AcceptedRunStart;
+}
+
+export interface EarshotIncidentReference {
+  incidentId: string;
+  endpoint: string;
+  deliveryStatus: "attempted" | "attached";
+  /** Earshot project ID only; API keys and other credentials are never persisted here. */
+  upstreamProjectId?: string;
+}
+
+export interface ProjectPurgeReceipt {
+  projectId: string;
+  status: "local_data_deleted";
+  linkedEarshotIncidents: EarshotIncidentReference[];
+  completedAt: string;
 }
 
 export interface LabState {
@@ -157,6 +291,10 @@ export interface LabState {
   evaluators: EvaluatorDefinition[];
   experiments: Experiment[];
   runs: RunArtifact[];
+  providerAttemptUsage: ProviderAttemptUsage[];
+  runStartRequests: RunStartRequestRecord[];
+  earshotReferences: EarshotIncidentReference[];
+  projectPurge: ProjectPurgeReceipt | null;
   regressionSet: RegressionEntry[];
 }
 
@@ -165,6 +303,7 @@ export interface VariantComparisonRow {
   variantName: string;
   providerLabel: string;
   runCount: number;
+  runningRuns: number;
   passedRuns: number;
   failedRuns: number;
   unknownRuns: number;
@@ -179,6 +318,7 @@ export interface Comparison {
   baselineVariantId: string | null;
   rows: VariantComparisonRow[];
   totalRuns: number;
+  totalRunning: number;
   totalPassed: number;
   totalFailed: number;
   totalUnknown: number;
@@ -186,18 +326,25 @@ export interface Comparison {
 
 export interface ExperimentDetail {
   experiment: Experiment;
+  revisions: ExperimentRevisionSummary[];
   scenarios: ScenarioRevision[];
   variants: VariantRevision[];
   runs: RunArtifact[];
   comparison: Comparison;
+  /** Present for detail requests; exports can also report when the run cap was reached. */
+  runsHasMore?: boolean;
+  runsCursor?: RunPageCursor | null;
+  runsTruncated?: boolean;
 }
 
 export interface BootstrapPayload {
   product: "voice-labs";
+  projectId: string;
   scenarios: ScenarioRevision[];
   variants: VariantRevision[];
   evaluators: EvaluatorDefinition[];
   experiments: Experiment[];
-  recentRuns: RunArtifact[];
+  recentRuns: RunSummary[];
   regressionScenarioIds: string[];
+  regressionScenarioRevisions: RegressionMembership[];
 }

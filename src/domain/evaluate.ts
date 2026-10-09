@@ -40,7 +40,10 @@ export function evaluateRun(
   scenario: ScenarioRevision,
   definitions: EvaluatorDefinition[] = defaultEvaluators(),
 ): EvaluationResult[] {
-  const allText = normalizeText(run.transcript.map((turn) => turn.text).join(" "));
+  const assistantText = normalizeText(run.transcript
+    .filter((turn) => turn.speaker === "assistant")
+    .map((turn) => turn.text)
+    .join(" "));
   const results: EvaluationResult[] = [];
 
   for (const definition of definitions) {
@@ -66,7 +69,7 @@ export function evaluateRun(
         break;
       }
       case "guardrail": {
-        const violations = scenario.forbiddenPhrases.filter((phrase) => allText.includes(normalizeText(phrase)));
+        const violations = scenario.forbiddenPhrases.filter((phrase) => assistantText.includes(normalizeText(phrase)));
         results.push(
           result(
             "guardrail",
@@ -74,7 +77,7 @@ export function evaluateRun(
             definition.weight,
             violations.length > 0 ? "failed" : "passed",
             violations.length > 0 ? 0 : 1,
-            violations.length > 0 ? `Forbidden language appeared: ${violations.join(", ")}.` : "No forbidden language appeared in the trace.",
+            violations.length > 0 ? `Forbidden language appeared in assistant output: ${violations.join(", ")}.` : "No forbidden language appeared in assistant output.",
             violations,
           ),
         );
@@ -84,7 +87,7 @@ export function evaluateRun(
         if (scenario.requiredPhrases.length === 0) {
           results.push(result("phrase", definition.name, definition.weight, "unknown", 0, "No required phrases were defined.", []));
         } else {
-          const matched = scenario.requiredPhrases.filter((phrase) => allText.includes(normalizeText(phrase)));
+          const matched = scenario.requiredPhrases.filter((phrase) => assistantText.includes(normalizeText(phrase)));
           const score = matched.length / scenario.requiredPhrases.length;
           results.push(
             result(
@@ -93,7 +96,7 @@ export function evaluateRun(
               definition.weight,
               score === 1 ? "passed" : "failed",
               score,
-              score === 1 ? "Every required phrase appeared in the trace." : `${scenario.requiredPhrases.length - matched.length} required phrase(s) were missing.`,
+              score === 1 ? "Every required phrase appeared in assistant output." : `${scenario.requiredPhrases.length - matched.length} required phrase(s) were missing from assistant output.`,
               matched,
             ),
           );
@@ -122,7 +125,7 @@ export function evaluateRun(
       }
       case "latency": {
         const budget = scenario.latencyBudgetMs;
-        if (!Number.isFinite(run.durationMs) || budget <= 0) {
+        if (run.durationMs === undefined || !Number.isFinite(run.durationMs) || budget <= 0) {
           results.push(result("latency", definition.name, definition.weight, "unknown", 0, "Latency evidence or budget is unavailable.", []));
         } else {
           const passed = run.durationMs <= budget;

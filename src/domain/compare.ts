@@ -8,26 +8,29 @@ export function compareRuns(runs: RunArtifact[], variants: VariantRevision[]): C
   const baselineVariantId = variants[0]?.id ?? null;
   const rows: VariantComparisonRow[] = variants.map((variant) => {
     const variantRuns = runs.filter((run) => run.variantId === variant.id);
-    const passedRuns = variantRuns.filter((run) => run.status === "passed").length;
-    const failedRuns = variantRuns.filter((run) => run.status === "failed" || run.status === "error").length;
-    const unknownRuns = variantRuns.filter((run) => run.status === "unknown" || run.status === "cancelled" || !run.status).length;
-    const knownEvaluationScores = variantRuns
+    const runningRuns = variantRuns.filter((run) => run.status === "running" || run.status === "queued").length;
+    const completedRuns = variantRuns.filter((run) => run.status !== "running" && run.status !== "queued");
+    const passedRuns = completedRuns.filter((run) => run.status === "passed").length;
+    const failedRuns = completedRuns.filter((run) => run.status === "failed" || run.status === "error").length;
+    const unknownRuns = completedRuns.filter((run) => run.status === "unknown" || run.status === "cancelled" || !run.status).length;
+    const knownEvaluationScores = completedRuns
       .flatMap((run) => run.evaluations ?? [])
       .filter((evaluation) => evaluation.status !== "unknown");
-    const latencyValues = variantRuns.map((run) => run.durationMs).filter(Number.isFinite);
+    const latencyValues = completedRuns.map((run) => run.durationMs).filter((value): value is number => value !== undefined && Number.isFinite(value));
     const qualityScore = knownEvaluationScores.length === 0
       ? null
       : round(knownEvaluationScores.reduce((sum, evaluation) => sum + evaluation.score * evaluation.weight, 0) / knownEvaluationScores.reduce((sum, evaluation) => sum + evaluation.weight, 0));
     return {
       variantId: variant.id,
       variantName: variant.name,
-      providerLabel: variant.providerLabel,
-      runCount: variantRuns.length,
+      providerLabel: providerLabelForRuns(variant.providerLabel, variantRuns),
+      runCount: completedRuns.length,
+      runningRuns,
       passedRuns,
       failedRuns,
       unknownRuns,
-      passRate: variantRuns.length === 0 ? 0 : round(passedRuns / variantRuns.length),
-      unknownRate: variantRuns.length === 0 ? 0 : round(unknownRuns / variantRuns.length),
+      passRate: completedRuns.length === 0 ? 0 : round(passedRuns / completedRuns.length),
+      unknownRate: completedRuns.length === 0 ? 0 : round(unknownRuns / completedRuns.length),
       qualityScore,
       averageLatencyMs: latencyValues.length === 0 ? null : Math.round(latencyValues.reduce((sum, value) => sum + value, 0) / latencyValues.length),
       deltaFromBaseline: null,
@@ -43,8 +46,25 @@ export function compareRuns(runs: RunArtifact[], variants: VariantRevision[]): C
     baselineVariantId,
     rows,
     totalRuns: runs.length,
+    totalRunning: runs.filter((run) => run.status === "running" || run.status === "queued").length,
     totalPassed: runs.filter((run) => run.status === "passed").length,
     totalFailed: runs.filter((run) => run.status === "failed" || run.status === "error").length,
     totalUnknown: runs.filter((run) => run.status === "unknown" || run.status === "cancelled" || !run.status).length,
   };
+}
+
+function providerLabelForRuns(fallback: string, runs: RunArtifact[]): string {
+  const labels = [...new Set(runs.flatMap((run) => {
+    if (run.status === "running" || run.status === "queued") return [];
+    if (run.mode === "deterministic") return ["Deterministic simulation"];
+    const trace = run.providerTrace;
+    if (!trace) return [run.status === "error" ? "Provider run failed" : "Provider details unavailable"];
+    const useStt = trace.inputMode === "audio_fixture";
+    const providers = [useStt ? trace.stt : undefined, trace.llm, trace.tts].filter(Boolean);
+    const models = [useStt ? trace.sttModel : undefined, trace.llmModel, trace.ttsModel].filter(Boolean);
+    return [models.length > 0 ? models.join(" / ") : providers.join(" / ")];
+  }))];
+  if (labels.length === 0) return runs.length > 0 ? "Run in progress" : fallback;
+  if (labels.length <= 2) return labels.join(" + ");
+  return `${labels.length} runtime configurations`;
 }

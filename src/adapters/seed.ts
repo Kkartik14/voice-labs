@@ -1,10 +1,11 @@
 import { defaultEvaluators } from "../domain/evaluate.js";
 import type { LabState } from "../domain/model.js";
 
-export function createSeedState(now = new Date().toISOString()): LabState {
+export function createSeedState(now = new Date().toISOString(), projectId = "local", createdBy = "local-development"): LabState {
   const scenario = {
     id: "scn_reschedule",
     scenarioId: "scenario_reschedule",
+    projectId,
     revision: 1,
     name: "Reschedule an appointment",
     description: "A caller changes an existing appointment and needs a trustworthy confirmation.",
@@ -21,10 +22,12 @@ export function createSeedState(now = new Date().toISOString()): LabState {
     latencyBudgetMs: 1_400,
     tags: ["critical", "scheduling"],
     createdAt: now,
+    createdBy,
   };
   const reliable = {
     id: "var_reliable",
     variantId: "variant_reliable",
+    projectId,
     revision: 1,
     name: "Reliable baseline",
     description: "A careful candidate that confirms state after a successful tool call.",
@@ -35,10 +38,12 @@ export function createSeedState(now = new Date().toISOString()): LabState {
     latencyMs: 180,
     providerLabel: "deterministic / baseline",
     createdAt: now,
+    createdBy,
   };
   const fragile = {
     id: "var_fragile",
     variantId: "variant_fragile",
+    projectId,
     revision: 1,
     name: "Fast but fragile",
     description: "A faster candidate that occasionally loses the confirmation step.",
@@ -49,17 +54,25 @@ export function createSeedState(now = new Date().toISOString()): LabState {
     latencyMs: 80,
     providerLabel: "deterministic / candidate",
     createdAt: now,
+    createdBy,
   };
   const experiment = {
     id: "exp_reschedule_baseline",
+    experimentId: "experiment_reschedule_baseline",
+    projectId,
+    revision: 1,
     name: "Appointment rescheduling baseline",
     description: "Compare a reliable confirmation flow with a faster candidate.",
     scenarioIds: [scenario.scenarioId],
     variantIds: [reliable.variantId, fragile.variantId],
+    scenarioRevisionIds: [scenario.id],
+    variantRevisionIds: [reliable.id, fragile.id],
     repetitions: 2,
     mode: "deterministic" as const,
+    captureEvidence: false,
     evaluatorIds: defaultEvaluators().map((evaluator) => evaluator.id),
     createdAt: now,
+    createdBy,
   };
 
   return {
@@ -68,6 +81,10 @@ export function createSeedState(now = new Date().toISOString()): LabState {
     evaluators: defaultEvaluators(),
     experiments: [experiment],
     runs: [],
+    providerAttemptUsage: [],
+    runStartRequests: [],
+    earshotReferences: [],
+    projectPurge: null,
     regressionSet: [],
   };
 }

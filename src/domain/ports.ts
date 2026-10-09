@@ -1,11 +1,21 @@
-import type { ExecutionMode, RunArtifact, ScenarioRevision, VariantRevision } from "./model.js";
+import type {
+  EarshotIncidentReference,
+  EvidenceReference,
+  ExecutionMode,
+  ProjectContext,
+  RunArtifact,
+  ScenarioRevision,
+  VariantRevision,
+} from "./model.js";
 
 export interface Clock {
   now(): Date;
 }
 
 export interface RunRequest {
+  context: ProjectContext;
   experimentId: string;
+  experimentRevisionId: string;
   scenario: ScenarioRevision;
   variant: VariantRevision;
   repetition: number;
@@ -14,9 +24,12 @@ export interface RunRequest {
 }
 
 export interface RunExecutor {
-  execute(request: RunRequest): Promise<RunArtifact>;
+  preflight?(mode: ExecutionMode, scenarios?: readonly ScenarioRevision[], signal?: AbortSignal): Promise<unknown> | unknown;
+  execute(request: RunRequest, preparation?: unknown, signal?: AbortSignal): Promise<RunArtifact>;
 }
 
 export interface EvidenceSink {
-  attach(run: RunArtifact): Promise<RunArtifact["evidence"]>;
+  readonly endpoint: string;
+  referenceFor?(context: Pick<ProjectContext, "projectId">, run: RunArtifact): EarshotIncidentReference;
+  attach(context: Pick<ProjectContext, "projectId">, run: RunArtifact, signal?: AbortSignal): Promise<EvidenceReference>;
 }
