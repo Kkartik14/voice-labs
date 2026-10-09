@@ -1,0 +1,24 @@
+{
+  "name": "@voice-labs/feature",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "files": [
+    "dist"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/types/web/feature.d.ts",
+      "import": "./dist/feature.js"
+    },
+    "./styles.css": "./dist/styles.css"
+  },
+  "sideEffects": [
+    "./dist/styles.css"
+  ],
+  "peerDependencies": {
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "description": "Locally linked embeddable Voice Labs feature for Platform integration."
+}
