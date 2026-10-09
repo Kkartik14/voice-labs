@@ -7,7 +7,8 @@ const systemClock: Clock = { now: () => new Date() };
 export class DeterministicRunner implements RunExecutor {
   public constructor(private readonly options: { now?: () => Date } = {}) {}
 
-  public async execute(request: RunRequest): Promise<RunArtifact> {
+  public async execute(request: RunRequest, _preparation?: unknown, signal?: AbortSignal): Promise<RunArtifact> {
+    if (signal?.aborted) throw signal.reason ?? new Error("Run execution was cancelled.");
     const clock = this.options.now ? { now: this.options.now } : systemClock;
     const started = clock.now();
     const seed = request.seed || stableSeed(request.experimentId, request.scenario.id, request.variant.id, request.repetition);
@@ -46,7 +47,9 @@ export class DeterministicRunner implements RunExecutor {
 
     return {
       id: newId("run"),
+      projectId: request.context.projectId,
       experimentId: request.experimentId,
+      experimentRevisionId: request.experimentRevisionId,
       scenarioId: request.scenario.id,
       variantId: request.variant.id,
       repetition: request.repetition,
@@ -55,6 +58,7 @@ export class DeterministicRunner implements RunExecutor {
       startedAt: started.toISOString(),
       completedAt: completedAt.toISOString(),
       durationMs,
+      latencyScope: "executor_wall_clock_including_setup_excluding_persistence",
       transcript,
       toolCalls,
       finalFacts,

@@ -5,11 +5,25 @@
   "description": "Local-first simulation and evaluation workspace for voice agents.",
   "type": "module",
   "packageManager": "pnpm@11.10.0",
+  "exports": {
+    "./feature": {
+      "types": "./dist/feature/types/web/feature.d.ts",
+      "import": "./dist/feature/feature.js"
+    },
+    "./feature/styles.css": "./dist/feature/styles.css"
+  },
+  "sideEffects": ["**/*.css"],
+  "peerDependencies": {
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
   "scripts": {
     "dev": "concurrently -k \"tsx src/server/main.ts\" \"vite\"",
     "dev:server": "tsx watch src/server/main.ts",
     "dev:web": "vite",
     "build": "tsc --noEmit && vite build",
+    "build:feature": "vite build --config vite.feature.config.ts && tsc -p tsconfig.feature.json && node scripts/copy-feature-styles.mjs && node scripts/prepare-feature-package.mjs",
+    "pack:feature": "pnpm build:feature && pnpm --dir packages/feature pack --pack-destination ../../artifacts",
     "typecheck": "tsc --noEmit",
     "lint": "tsc --noEmit",
     "test": "vitest run",
@@ -19,17 +33,20 @@
   },
   "dependencies": {
     "dotenv": "^16.4.7",
-    "react": "^19.1.1",
-    "react-dom": "^19.1.1",
-    "voice-runtime": "file:../TVIC/packages/voice-runtime",
+    "jose": "6.2.12",
+    "pg": "8.23.0",
+    "voice-runtime": "1.2.0",
     "zod": "^4.1.5"
   },
   "devDependencies": {
     "@types/node": "^24.5.2",
-    "@types/react": "^19.1.13",
-    "@types/react-dom": "^19.1.9",
+    "@types/pg": "8.23.1",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
     "@vitejs/plugin-react": "^5.0.4",
     "concurrently": "^9.2.1",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
     "tsx": "^4.20.5",
     "typescript": "^5.9.2",
     "vite": "^7.1.7",

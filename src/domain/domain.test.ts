@@ -6,6 +6,7 @@ import type { RunArtifact, ScenarioRevision, VariantRevision } from "./model.js"
 const scenario: ScenarioRevision = {
   id: "scn_appointment_1",
   scenarioId: "scenario_appointment",
+  projectId: "local",
   revision: 1,
   name: "Reschedule an appointment",
   description: "A caller changes an existing appointment.",
@@ -19,11 +20,13 @@ const scenario: ScenarioRevision = {
   latencyBudgetMs: 1_000,
   tags: ["critical"],
   createdAt: "2026-01-01T00:00:00.000Z",
+  createdBy: "test-user",
 };
 
 const variant: VariantRevision = {
   id: "var_reliable_1",
   variantId: "variant_reliable",
+  projectId: "local",
   revision: 1,
   name: "Reliable baseline",
   description: "Completes the request and confirms the result.",
@@ -34,6 +37,7 @@ const variant: VariantRevision = {
   latencyMs: 120,
   providerLabel: "deterministic",
   createdAt: "2026-01-01T00:00:00.000Z",
+  createdBy: "test-user",
 };
 
 const secondVariant: VariantRevision = {
@@ -47,7 +51,9 @@ const secondVariant: VariantRevision = {
 function run(overrides: Partial<RunArtifact> = {}): RunArtifact {
   return {
     id: "run_1",
+    projectId: "local",
     experimentId: "exp_1",
+    experimentRevisionId: "exp_revision_1",
     scenarioId: scenario.id,
     variantId: variant.id,
     repetition: 1,
@@ -56,6 +62,7 @@ function run(overrides: Partial<RunArtifact> = {}): RunArtifact {
     startedAt: "2026-01-01T00:00:00.000Z",
     completedAt: "2026-01-01T00:00:00.200Z",
     durationMs: 200,
+    latencyScope: "executor_wall_clock_including_setup_excluding_persistence",
     transcript: [
       { index: 0, speaker: "user", text: scenario.userTurns[0], offsetMs: 0 },
       { index: 1, speaker: "assistant", text: "Done for tomorrow.", offsetMs: 120 },
@@ -110,6 +117,18 @@ describe("evaluateRun", () => {
     expect(results.find((result) => result.kind === "tool_call")?.status).toBe("failed");
     expect(results.find((result) => result.kind === "guardrail")?.status).toBe("failed");
   });
+
+  it("checks required and forbidden language only against assistant output", () => {
+    const results = evaluateRun(run({
+      transcript: [
+        { index: 0, speaker: "user", text: "I cannot help, and tomorrow works for me.", offsetMs: 0 },
+        { index: 1, speaker: "assistant", text: "Would you like me to reschedule it?", offsetMs: 120 },
+      ],
+    }), scenario);
+
+    expect(results.find((result) => result.kind === "guardrail")?.status).toBe("passed");
+    expect(results.find((result) => result.kind === "phrase")?.status).toBe("failed");
+  });
 });
 
 describe("compareRuns", () => {
@@ -127,5 +146,17 @@ describe("compareRuns", () => {
     expect(comparison.rows.find((row) => row.variantId === variant.id)?.passRate).toBe(1);
     expect(comparison.rows.find((row) => row.variantId === "var_fragile_1")?.failedRuns).toBeGreaterThan(0);
     expect(comparison.rows.find((row) => row.variantId === "var_fragile_1")?.unknownRate).toBe(0);
+  });
+
+  it("keeps active attempts out of completed pass rates and latency averages", () => {
+    const active = run({ id: "run_active", status: "running", completedAt: undefined, durationMs: undefined, evaluations: undefined });
+    const comparison = compareRuns([run(), active], [variant]);
+
+    expect(comparison.totalRuns).toBe(2);
+    expect(comparison.totalRunning).toBe(1);
+    expect(comparison.rows[0].runCount).toBe(1);
+    expect(comparison.rows[0].runningRuns).toBe(1);
+    expect(comparison.rows[0].passRate).toBe(1);
+    expect(comparison.rows[0].averageLatencyMs).toBe(200);
   });
 });
