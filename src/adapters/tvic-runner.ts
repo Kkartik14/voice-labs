@@ -1,4 +1,5 @@
-import { readFile } from "node:fs/promises";
+import { readFile, realpath, stat } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { isAbsolute, relative, resolve } from "node:path";
 import { config as loadDotenv } from "dotenv";
 import {
@@ -24,11 +25,13 @@ import {
   type VoiceEvent,
 } from "voice-runtime";
 import { newId } from "../domain/ids.js";
+import { UNCONFIRMED_RUNTIME_CLEANUP_CODE, UNCONFIRMED_RUNTIME_CLEANUP_MESSAGE } from "../domain/run-lifecycle.js";
 import type {
   ProviderInputMode,
   ProviderTrace,
   RunArtifact,
   RunError,
+  ScenarioRevision,
   ToolCall,
 } from "../domain/model.js";
 import type { RunExecutor, RunRequest } from "../domain/ports.js";
@@ -39,6 +42,9 @@ const AUDIO_FRAME_MS = 20;
 const AUDIO_FRAME_BYTES = (PCM16_16K_MONO.sampleRateHz / 1_000) * AUDIO_FRAME_MS * AUDIO_SAMPLE_BYTES;
 const TURN_TRAILING_SILENCE_MS = 400;
 const TURN_TIMEOUT_MS = 30_000;
+const AGENT_START_TIMEOUT_MS = 30_000;
+const RUNTIME_STOP_TIMEOUT_MS = 5_000;
+const MAX_AUDIO_FIXTURE_BYTES = 1 * 1024 * 1024;
 
 const SCRIPTED_STT_CAPABILITIES = {
   streaming: { input: true, output: true, native: false },
@@ -75,6 +81,25 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): 
       },
       (error) => {
         clearTimeout(timer);
+        rejectPromise(error);
+      },
+    );
+  });
+}
+
+function withAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(signal.reason ?? new Error("Run execution was cancelled."));
+  return new Promise<T>((resolvePromise, rejectPromise) => {
+    const onAbort = () => rejectPromise(signal.reason ?? new Error("Run execution was cancelled."));
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolvePromise(value);
+      },
+      (error) => {
+        signal.removeEventListener("abort", onAbort);
         rejectPromise(error);
       },
     );
@@ -232,6 +257,8 @@ class SimulationCallHandle implements CallHandle {
 
 interface CapturedRun {
   readonly startedAtMs: number;
+  callId?: string;
+  sessionId?: string;
   readonly userTurns: Array<{ readonly text: string; readonly at: number }>;
   readonly assistantTurns: Array<{ readonly text: string; readonly at: number }>;
   readonly toolCalls: Map<string, ToolCall>;
@@ -294,17 +321,21 @@ function createSandboxTools(request: RunRequest): readonly ReturnType<typeof def
     defineTool({
       id: `voice_labs_${name.replace(/[^a-zA-Z0-9_]/g, "_")}`,
       name,
-      description: `A deterministic Voice Labs fixture for ${name}. It records the call and returns the scenario's expected facts.`,
+      description: `A Voice Labs harness tool for ${name}. No business system is connected, so it cannot confirm a side effect.`,
       inputSchema: { type: "object" },
       outputSchema: { type: "object" },
-      async execute(input) {
-        return { ok: true, facts: request.scenario.expectedOutcomeFacts, input };
+      async execute() {
+        return { ok: false, error: "No business tool is connected to this Voice Labs scenario." };
       },
     }),
   );
 }
 
-function buildProviderTrace(agent: VoiceAgent, inputMode: ProviderInputMode): ProviderTrace {
+function buildProviderTrace(
+  agent: VoiceAgent,
+  inputMode: ProviderInputMode,
+  models: Pick<ProviderTrace, "sttModel" | "llmModel" | "ttsModel" | "ttsVoiceId">,
+): ProviderTrace {
   return {
     runtime: "tvic",
     inputMode,
@@ -312,6 +343,7 @@ function buildProviderTrace(agent: VoiceAgent, inputMode: ProviderInputMode): Pr
     stt: agent.providers.stt,
     llm: agent.providers.llm,
     tts: agent.providers.tts,
+    ...models,
   };
 }
 
@@ -332,7 +364,9 @@ function errorArtifact(request: RunRequest, startedAt: Date, error: unknown, tra
   const completedAt = new Date();
   return {
     id: newId("run"),
+    projectId: request.context.projectId,
     experimentId: request.experimentId,
+    experimentRevisionId: request.experimentRevisionId,
     scenarioId: request.scenario.id,
     variantId: request.variant.id,
     repetition: request.repetition,
@@ -341,6 +375,7 @@ function errorArtifact(request: RunRequest, startedAt: Date, error: unknown, tra
     startedAt: startedAt.toISOString(),
     completedAt: completedAt.toISOString(),
     durationMs: Math.max(1, completedAt.getTime() - startedAt.getTime()),
+    latencyScope: "executor_wall_clock_including_setup_excluding_persistence",
     transcript: [],
     toolCalls: [],
     finalFacts: [],
@@ -362,15 +397,20 @@ function capturedArtifact(
   const completedAt = new Date();
   return {
     id: newId("run"),
+    projectId: request.context.projectId,
     experimentId: request.experimentId,
+    experimentRevisionId: request.experimentRevisionId,
     scenarioId: request.scenario.id,
     variantId: request.variant.id,
+    ...(captured.callId ? { callId: captured.callId } : {}),
+    ...(captured.sessionId ? { sessionId: captured.sessionId } : {}),
     repetition: request.repetition,
     seed: request.seed,
     mode: request.mode,
     startedAt: startedAt.toISOString(),
     completedAt: completedAt.toISOString(),
     durationMs: Math.max(1, completedAt.getTime() - startedAt.getTime()),
+    latencyScope: "executor_wall_clock_including_setup_excluding_persistence",
     transcript: buildTranscript(captured),
     toolCalls: [...captured.toolCalls.values()],
     finalFacts: [...captured.finalFacts],
@@ -395,12 +435,10 @@ function readUint32(buffer: Uint8Array, offset: number): number {
   return (buffer[offset] | (buffer[offset + 1] << 8) | (buffer[offset + 2] << 16) | (buffer[offset + 3] << 24)) >>> 0;
 }
 
-function readPcmFixture(bytes: Uint8Array, fixturePath: string): Uint8Array {
+function readPcmFixture(bytes: Uint8Array): Uint8Array {
   const isWave = bytes.byteLength >= 12 && String.fromCharCode(...bytes.slice(0, 4)) === "RIFF" && String.fromCharCode(...bytes.slice(8, 12)) === "WAVE";
-  if (!isWave) {
-    if (bytes.byteLength % AUDIO_SAMPLE_BYTES !== 0) throw new Error(`Audio fixture is not aligned to 16-bit PCM: ${fixturePath}`);
-    return bytes;
-  }
+  if (!isWave) throw new Error("Audio fixtures must be WAV files.");
+  if (readUint32(bytes, 4) + 8 !== bytes.byteLength) throw new Error("Audio fixture has an invalid WAV length.");
   let offset = 12;
   let channels: number | undefined;
   let sampleRate: number | undefined;
@@ -410,29 +448,102 @@ function readPcmFixture(bytes: Uint8Array, fixturePath: string): Uint8Array {
     const chunkId = String.fromCharCode(...bytes.slice(offset, offset + 4));
     const chunkSize = readUint32(bytes, offset + 4);
     const contentStart = offset + 8;
-    if (contentStart + chunkSize > bytes.byteLength) throw new Error(`Audio fixture has an invalid WAV chunk: ${fixturePath}`);
+      if (contentStart + chunkSize > bytes.byteLength) throw new Error("Audio fixture has an invalid WAV chunk.");
     if (chunkId === "fmt " && chunkSize >= 16) {
       const audioFormat = readInt16(bytes, contentStart);
       channels = readInt16(bytes, contentStart + 2);
       sampleRate = readUint32(bytes, contentStart + 4);
       bitsPerSample = readInt16(bytes, contentStart + 14);
-      if (audioFormat !== 1) throw new Error(`Audio fixture must be uncompressed PCM: ${fixturePath}`);
+      if (audioFormat !== 1) throw new Error("Audio fixture must be uncompressed PCM.");
     }
     if (chunkId === "data") data = bytes.slice(contentStart, contentStart + chunkSize);
     offset = contentStart + chunkSize + (chunkSize % 2);
   }
   if (channels !== 1 || sampleRate !== PCM16_16K_MONO.sampleRateHz || bitsPerSample !== 16 || !data) {
-    throw new Error(`Audio fixture must be mono 16-bit 16kHz PCM WAV: ${fixturePath}`);
+    throw new Error("Audio fixture must be mono 16-bit 16kHz PCM WAV.");
   }
+  if (data.byteLength === 0 || data.byteLength % AUDIO_SAMPLE_BYTES !== 0) throw new Error("Audio fixture PCM data is empty or misaligned.");
   return data;
 }
 
-async function readAudioFixture(root: string, fixture: string): Promise<Uint8Array> {
-  if (isAbsolute(fixture)) throw new Error(`Audio fixture must be relative to VOICE_LABS_AUDIO_ROOT: ${fixture}`);
-  const path = resolve(root, fixture);
-  const rootRelative = relative(root, path);
-  if (rootRelative.startsWith("..") || isAbsolute(rootRelative)) throw new Error(`Audio fixture escapes VOICE_LABS_AUDIO_ROOT: ${fixture}`);
-  return readPcmFixture(new Uint8Array(await readFile(path)), fixture);
+export async function readAudioFixture(root: string, projectId: string, fixture: string): Promise<Uint8Array> {
+  if (isAbsolute(fixture) || fixture.split(/[\\/]/).includes("..") || fixture.includes("\0")) {
+    throw new Error("Audio fixture paths must be safe relative paths inside VOICE_LABS_AUDIO_ROOT.");
+  }
+  const canonicalRoot = await realpath(root);
+  const projectDirectory = createHash("sha256").update(projectId).digest("hex");
+  const projectPath = resolve(canonicalRoot, projectDirectory);
+  const canonicalProjectPath = await realpath(projectPath);
+  const projectRelative = relative(canonicalRoot, canonicalProjectPath);
+  if (projectRelative.startsWith("..") || isAbsolute(projectRelative)) {
+    throw new Error("Project audio fixtures must stay inside VOICE_LABS_AUDIO_ROOT.");
+  }
+  const requestedPath = resolve(canonicalProjectPath, fixture);
+  const requestedRelative = relative(canonicalProjectPath, requestedPath);
+  if (!requestedRelative || requestedRelative.startsWith("..") || isAbsolute(requestedRelative)) {
+    throw new Error("Audio fixture paths must be safe relative paths inside VOICE_LABS_AUDIO_ROOT.");
+  }
+  const canonicalPath = await realpath(requestedPath);
+  const canonicalRelative = relative(canonicalProjectPath, canonicalPath);
+  if (canonicalRelative.startsWith("..") || isAbsolute(canonicalRelative)) {
+    throw new Error("Audio fixture resolves outside VOICE_LABS_AUDIO_ROOT.");
+  }
+  const info = await stat(canonicalPath);
+  if (!info.isFile()) throw new Error("Audio fixtures must be regular files.");
+  if (info.size > MAX_AUDIO_FIXTURE_BYTES) throw new Error(`Audio fixtures must not exceed ${MAX_AUDIO_FIXTURE_BYTES} bytes.`);
+  return readPcmFixture(new Uint8Array(await readFile(canonicalPath)));
+}
+
+interface AudioFixturePreparation {
+  readonly kind: "voice-labs-audio-fixtures";
+  readonly projectId: string;
+  readonly fixturesByScenario: ReadonlyMap<string, readonly Uint8Array[]>;
+}
+
+function isAudioFixturePreparation(value: unknown): value is AudioFixturePreparation {
+  if (typeof value !== "object" || value === null) return false;
+  const preparation = value as Partial<AudioFixturePreparation>;
+  return preparation.kind === "voice-labs-audio-fixtures" && preparation.fixturesByScenario instanceof Map;
+}
+
+async function loadAudioFixtures(
+  root: string,
+  projectId: string,
+  scenarios: readonly ScenarioRevision[],
+): Promise<AudioFixturePreparation> {
+  try {
+    if (!(await stat(root)).isDirectory()) throw new Error("Audio fixture root is not a directory.");
+  } catch {
+    throw Object.assign(new Error("Voice Labs audio fixture storage is unavailable on this host."), { statusCode: 503 });
+  }
+  const fixturesByScenario = new Map<string, readonly Uint8Array[]>();
+  for (const scenario of scenarios) {
+    if ((scenario.audioFixtures?.length ?? 0) !== scenario.userTurns.length) {
+      throw Object.assign(new Error(`Audio mode needs one fixture per caller turn in scenario “${scenario.name}”.`), { statusCode: 422 });
+    }
+    if (fixturesByScenario.has(scenario.id)) continue;
+    const scenarioFixtures: Uint8Array[] = [];
+    for (const fixture of scenario.audioFixtures ?? []) {
+      try {
+        scenarioFixtures.push(await readAudioFixture(root, projectId, fixture));
+      } catch (error) {
+        const code = typeof error === "object" && error !== null && "code" in error
+          ? (error as NodeJS.ErrnoException).code
+          : undefined;
+        if (code === "ENOENT" || code === "ENOTDIR") {
+          throw Object.assign(new Error(`Audio fixture “${fixture}” for scenario “${scenario.name}” was not found in this project's audio directory.`), { statusCode: 422 });
+        }
+        if (code) throw Object.assign(new Error("Voice Labs could not read this project's audio fixture storage."), { statusCode: 503 });
+        throw Object.assign(new Error(error instanceof Error ? error.message : "The audio fixture is invalid."), { statusCode: 422 });
+      }
+    }
+    fixturesByScenario.set(scenario.id, scenarioFixtures);
+  }
+  return { kind: "voice-labs-audio-fixtures", projectId, fixturesByScenario };
+}
+
+export async function validateAudioFixtures(root: string, projectId: string, scenarios: readonly ScenarioRevision[]): Promise<void> {
+  await loadAudioFixtures(root, projectId, scenarios);
 }
 
 export interface TvicRunnerOptions {
@@ -451,17 +562,53 @@ export class TvicVoiceRuntimeRunner implements RunExecutor {
   readonly #ttsVoiceId: string | undefined;
 
   constructor(options: TvicRunnerOptions = {}) {
-    this.#audioRoot = resolve(options.audioRoot ?? process.env.VOICE_LABS_AUDIO_ROOT ?? process.cwd());
+    this.#audioRoot = resolve(options.audioRoot ?? process.env.VOICE_LABS_AUDIO_ROOT ?? resolve(process.cwd(), "audio-fixtures"));
     this.#sttModel = options.sttModel ?? optionalEnvironment("VOICE_LABS_TVIC_STT_MODEL");
     this.#llmModel = options.llmModel ?? optionalEnvironment("VOICE_LABS_TVIC_LLM_MODEL") ?? optionalEnvironment("GROQ_MODEL") ?? "openai/gpt-oss-20b";
     this.#ttsModel = options.ttsModel ?? optionalEnvironment("VOICE_LABS_TVIC_TTS_MODEL");
     this.#ttsVoiceId = options.ttsVoiceId ?? optionalEnvironment("VOICE_LABS_TVIC_TTS_VOICE_ID") ?? optionalEnvironment("CARTESIA_VOICE_ID");
   }
 
-  async execute(request: RunRequest): Promise<RunArtifact> {
+  preflight(mode: "deterministic" | "tvic" | "audio", scenarios: readonly ScenarioRevision[] = []): Promise<unknown> | unknown {
+    if (mode === "deterministic") return;
+    this.#assertProviderConfiguration(mode);
+    if (mode === "audio") return loadAudioFixtures(this.#audioRoot, scenarios[0]?.projectId ?? "", scenarios);
+  }
+
+  #assertProviderConfiguration(mode: "deterministic" | "tvic" | "audio"): void {
+    if (mode === "deterministic") return;
+    const missing = [
+      ...(!optionalEnvironment("GROQ_API_KEY") ? ["GROQ_API_KEY"] : []),
+      ...(!optionalEnvironment("CARTESIA_API_KEY") ? ["CARTESIA_API_KEY"] : []),
+      ...(!this.#ttsVoiceId ? ["CARTESIA_VOICE_ID or VOICE_LABS_TVIC_TTS_VOICE_ID"] : []),
+      ...(mode === "audio" && !optionalEnvironment("DEEPGRAM_API_KEY") ? ["DEEPGRAM_API_KEY"] : []),
+    ];
+    if (missing.length > 0) {
+      throw Object.assign(new Error(`Missing provider configuration: ${missing.join(", ")}.`), { statusCode: 503 });
+    }
+  }
+
+  async execute(request: RunRequest, preparation?: unknown, signal?: AbortSignal): Promise<RunArtifact> {
     const startedAt = new Date();
-    if (request.mode === "audio" && (request.scenario.audioFixtures?.length ?? 0) < request.scenario.userTurns.length) {
-      return errorArtifact(request, startedAt, new Error("Audio mode requires one audioFixtures path for every scenario user turn."));
+    if (request.mode === "audio" && (request.scenario.audioFixtures?.length ?? 0) !== request.scenario.userTurns.length) {
+      return errorArtifact(request, startedAt, Object.assign(
+        new Error("Audio mode requires one audioFixtures path for every scenario user turn."),
+        { statusCode: 422 },
+      ));
+    }
+    const audioFixtures: Uint8Array[] = [];
+    try {
+      this.#assertProviderConfiguration(request.mode);
+      if (request.mode === "audio") {
+        const audioPreparation = isAudioFixturePreparation(preparation) && preparation.projectId === request.context.projectId
+          ? preparation
+          : await loadAudioFixtures(this.#audioRoot, request.context.projectId, [request.scenario]);
+        const preparedFixtures = audioPreparation.fixturesByScenario.get(request.scenario.id);
+        if (!preparedFixtures) throw Object.assign(new Error("The audio fixture preflight did not include this scenario revision."), { statusCode: 422 });
+        audioFixtures.push(...preparedFixtures);
+      }
+    } catch (error) {
+      return errorArtifact(request, startedAt, error);
     }
 
     const inputMode: ProviderInputMode = request.mode === "audio" ? "audio_fixture" : "scripted_transcript";
@@ -473,19 +620,27 @@ export class TvicVoiceRuntimeRunner implements RunExecutor {
     let handle: SimulationCallHandle | undefined;
     try {
       agent = createVoiceAgent(this.agentOptions(request, scriptedStt?.provider));
-      trace = buildProviderTrace(agent, inputMode);
+      trace = buildProviderTrace(agent, inputMode, {
+        sttModel: scriptedStt ? "voice-labs-scripted" : this.#sttModel,
+        llmModel: this.#llmModel,
+        ttsModel: this.#ttsModel,
+        ttsVoiceId: this.#ttsVoiceId,
+      });
       captured = createCapturedRun();
       const callId = `voice_labs_call_${newId("call")}` as CallId;
+      captured.callId = callId;
       handle = new SimulationCallHandle(callId);
-      const session = await agent.start({
+      const session = await withAbort(withTimeout(agent.start({
         call: buildCall(callId),
         callHandle: handle,
         channel: "simulated",
         textDelivery: "always",
         metadata: { voiceLabsExperimentId: request.experimentId, voiceLabsVariantId: request.variant.id },
-      });
+        ...(signal ? { signal } : {}),
+      }), AGENT_START_TIMEOUT_MS, "TVIC agent startup"), signal);
+      captured.sessionId = session.sessionId;
       observation = this.observe(session.run, captured, handle);
-      if (scriptedStt) await withTimeout(scriptedStt.waitUntilOpen(), TURN_TIMEOUT_MS, "TVIC scripted STT startup");
+      if (scriptedStt) await withAbort(withTimeout(scriptedStt.waitUntilOpen(), TURN_TIMEOUT_MS, "TVIC scripted STT startup"), signal);
       handle.push(createMediaEvent({
         id: inputEventId("voice_labs_stream_started", 1) as never,
         type: "media.stream.started",
@@ -503,15 +658,16 @@ export class TvicVoiceRuntimeRunner implements RunExecutor {
           const completed = deferred<VoiceEvent & { readonly kind: "turn_completed" }>();
           captured.completedWaiters.push(completed);
           scriptedStt.pushTurn(session.sessionId, request.scenario.userTurns[index], sequence);
-          const completion = await withTimeout(completed.promise, TURN_TIMEOUT_MS, `TVIC turn ${sequence}`);
+          const completion = await withAbort(withTimeout(completed.promise, TURN_TIMEOUT_MS, `TVIC turn ${sequence}`), signal);
           if (completion.status !== "completed") {
             const detail = captured.errors[0]?.message ? ` ${captured.errors[0].message}` : "";
             throw new Error(`TVIC turn ${sequence} ended with status ${completion.status}.${detail}`);
           }
         } else {
-          const fixture = request.scenario.audioFixtures?.[index];
-          if (!fixture) throw new Error(`Missing audio fixture for user turn ${sequence}.`);
-          const bytes = await readAudioFixture(this.#audioRoot, fixture);
+          const completed = deferred<VoiceEvent & { readonly kind: "turn_completed" }>();
+          captured.completedWaiters.push(completed);
+          const bytes = audioFixtures[index];
+          if (!bytes) throw new Error(`Missing audio fixture for user turn ${sequence}.`);
           const nextAudioSequence = await this.pushAudio(handle, session.sessionId, bytes, captured, sequence);
           await this.pushAudio(
             handle,
@@ -535,6 +691,11 @@ export class TvicVoiceRuntimeRunner implements RunExecutor {
               monotonicOffsetMs: 0,
             }));
           }
+          const completion = await withAbort(withTimeout(completed.promise, TURN_TIMEOUT_MS, `TVIC audio turn ${sequence}`), signal);
+          if (completion.status !== "completed") {
+            const detail = captured.errors[0]?.message ? ` ${captured.errors[0].message}` : "";
+            throw new Error(`TVIC audio turn ${sequence} ended with status ${completion.status}.${detail}`);
+          }
         }
       }
 
@@ -549,8 +710,8 @@ export class TvicVoiceRuntimeRunner implements RunExecutor {
         reason: "completed",
         durationMs: Math.max(0, Date.now() - captured.startedAtMs),
       }));
-      await session.run;
-      await observation;
+      await withAbort(withTimeout(Promise.resolve(session.run), TURN_TIMEOUT_MS, "TVIC session shutdown"), signal);
+      await withAbort(withTimeout(observation, TURN_TIMEOUT_MS, "TVIC event stream shutdown"), signal);
       for (const reason of handle.closeReasons) {
         if (captured.eventKinds.length < 200) captured.eventKinds.push(`transport_close:${reason}`);
       }
@@ -569,7 +730,13 @@ export class TvicVoiceRuntimeRunner implements RunExecutor {
       }
       return errorArtifact(request, startedAt, error, trace);
     } finally {
-      await agent?.stop().catch(() => undefined);
+      if (agent) {
+        try {
+          await withTimeout(agent.stop(), RUNTIME_STOP_TIMEOUT_MS, "TVIC runtime shutdown");
+        } catch (error) {
+          throw Object.assign(new Error(UNCONFIRMED_RUNTIME_CLEANUP_MESSAGE), { code: UNCONFIRMED_RUNTIME_CLEANUP_CODE, cause: error });
+        }
+      }
     }
   }
 
@@ -683,13 +850,18 @@ export class TvicVoiceRuntimeRunner implements RunExecutor {
           case "tool_result": {
             const existing = captured.toolCalls.get(event.toolCallId);
             if (existing) {
+              const output = event.output && typeof event.output === "object" ? event.output as { ok?: unknown; error?: unknown } : {};
+              const succeeded = output.ok === true;
               captured.toolCalls.set(event.toolCallId, {
                 ...existing,
-                status: "succeeded",
+                status: succeeded ? "succeeded" : "failed",
                 elapsedMs: event.latencyMs,
+                ...(!succeeded ? { error: typeof output.error === "string" ? output.error.slice(0, 500) : "The tool did not confirm completion." } : {}),
               });
             }
-            for (const fact of stringFacts(event.output)) captured.finalFacts.add(fact);
+            if (captured.toolCalls.get(event.toolCallId)?.status === "succeeded") {
+              for (const fact of stringFacts(event.output)) captured.finalFacts.add(fact);
+            }
             break;
           }
           case "turn_completed":
@@ -724,7 +896,9 @@ export class TvicVoiceRuntimeRunner implements RunExecutor {
 
 export function createTvicRunnerFromEnvironment(): TvicVoiceRuntimeRunner | undefined {
   if (process.env.VOICE_LABS_TVIC_ENABLED !== TVIC_ENABLED) return undefined;
-  return new TvicVoiceRuntimeRunner();
+  const runner = new TvicVoiceRuntimeRunner();
+  runner.preflight("tvic");
+  return runner;
 }
 
 export function loadTvicEnvironment(tvicRoot: string | undefined): void {
